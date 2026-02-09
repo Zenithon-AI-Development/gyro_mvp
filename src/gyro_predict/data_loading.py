@@ -80,7 +80,7 @@ def load_all_data(
         run_list: DataFrame with 'folder_name' column.
 
     Returns:
-        features: np.ndarray of shape (N, 378)
+        features: np.ndarray of shape (N, 383) = 378 TGLF + 5 global params
         targets: np.ndarray of shape (N, 2) = [Q_electron, Q_ion]
         metadata: DataFrame with folder_name, experiment, and targets
     """
@@ -111,8 +111,20 @@ def load_all_data(
 
         # Load features from TGLF
         raw_tglf = load_tglf_conditioning(npz_path)
-        feat = build_feature_vector(raw_tglf)
-        features_list.append(feat)
+        feat_tglf = build_feature_vector(raw_tglf)  # (378,)
+
+        # Extract 5 global parameters from CSV row
+        global_params = np.array([
+            float(row['DLNTDR_1']),
+            float(row['DLNNDR_1']),
+            float(row['KY']),
+            float(row['NU_EE']),
+            float(row['MASS_1']),
+        ], dtype=np.float64)
+
+        # Concatenate TGLF + globals
+        feat_full = np.concatenate([feat_tglf, global_params])  # (383,)
+        features_list.append(feat_full)
 
         loaded_folders.append(folder_name)
 

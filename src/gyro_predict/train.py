@@ -8,6 +8,7 @@ from itertools import product
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.model_selection import StratifiedKFold
@@ -176,6 +177,7 @@ def run_kfold(
     features: np.ndarray,
     targets: np.ndarray,
     experiment_groups: np.ndarray,
+    metadata: pd.DataFrame,
     model_config: ModelConfig,
     train_config: TrainConfig,
     device: torch.device,
@@ -191,6 +193,7 @@ def run_kfold(
     )
 
     fold_metrics = []
+    fold_details = []
     oof_predictions = np.zeros_like(targets)
 
     for fold_idx, (train_idx, val_idx) in enumerate(
@@ -234,6 +237,14 @@ def run_kfold(
             val_preds, train_config.target_transform, train_config.epsilon
         )
 
+        # Store fold details with run names
+        fold_details.append({
+            "fold": fold_idx,
+            "val_run_names": metadata.iloc[val_idx]["folder_name"].tolist(),
+            "val_predictions": oof_predictions[val_idx].tolist(),
+            "val_targets": targets[val_idx].tolist(),
+        })
+
         print(
             f"  Fold {fold_idx + 1}/{n_folds}: "
             f"rel_l2_mean={metrics['rel_l2_mean']:.4f}, "
@@ -251,6 +262,7 @@ def run_kfold(
         "std_rel_l2": float(np.std(rel_l2_values)),
         "oof_metrics": oof_metrics,
         "oof_predictions": oof_predictions,
+        "fold_details": fold_details,
     }
     return result
 
@@ -259,6 +271,7 @@ def run_hyperparameter_search(
     features: np.ndarray,
     targets: np.ndarray,
     experiment_groups: np.ndarray,
+    metadata: pd.DataFrame,
     config: Config,
     device: torch.device,
 ) -> Tuple[dict, list]:
@@ -325,7 +338,7 @@ def run_hyperparameter_search(
               f"arch={hidden_dims}, transform={tt}")
 
         result = run_kfold(
-            features, targets, experiment_groups, mc, tc, device, wandb_run
+            features, targets, experiment_groups, metadata, mc, tc, device, wandb_run
         )
 
         hp_dict["mean_rel_l2"] = result["mean_rel_l2"]

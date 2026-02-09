@@ -104,7 +104,7 @@ def main():
     if args.mode == "search":
         print("\n=== HYPERPARAMETER SEARCH ===")
         best_config_dict, all_results = run_hyperparameter_search(
-            features, targets, experiment_groups, config, device
+            features, targets, experiment_groups, metadata, config, device
         )
 
         # Save search results
@@ -136,7 +136,7 @@ def main():
         )
 
         kfold_result = run_kfold(
-            features, targets, experiment_groups, mc, tc, device
+            features, targets, experiment_groups, metadata, mc, tc, device
         )
 
         # Generate evaluation plots
@@ -156,7 +156,7 @@ def main():
 
         # Save summary
         summarize_results(
-            kfold_result, best_config_dict, tglf_comp,
+            kfold_result, best_config_dict, tglf_comp, metadata,
             os.path.join(config.paths.checkpoint_dir, "results_summary.json"),
         )
 
@@ -176,17 +176,19 @@ def main():
 
     # === MODE: train ===
     elif args.mode == "train":
-        print("\n=== TRAINING WITH SPECIFIED CONFIG ===")
-        hidden_dims = [int(x) for x in args.hidden_dims.split(",")]
+        print("\n=== TRAINING V2 WITH BEST V1 CONFIG (383-dim inputs) ===")
+        print("Hyperparameters: [512, 256, 128], dropout=0.2, lr=5e-4, weight_decay=0.01, raw transform")
+
+        # Best V1 hyperparameters (hardcoded from search_results.csv)
         mc = ModelConfig(
-            input_dim=config.features.total_features,
-            hidden_dims=hidden_dims,
-            dropout=args.dropout,
+            input_dim=383,  # 378 TGLF + 5 global params
+            hidden_dims=[512, 256, 128],
+            dropout=0.2,
         )
         tc = TrainConfig(
-            lr=args.lr,
-            weight_decay=args.weight_decay,
-            target_transform=args.target_transform,
+            lr=5e-4,
+            weight_decay=0.01,
+            target_transform="raw",
             epochs=config.train.epochs,
             patience=config.train.patience,
             n_folds=config.train.n_folds,
@@ -201,19 +203,22 @@ def main():
             wandb_run = wandb.init(
                 entity=config.wandb.entity,
                 project=config.wandb.project,
-                group="v1-mlp-train",
+                group="v2-mlp-global-params",
+                name="v2_best_config_383dims",
                 config={
-                    "dropout": args.dropout,
-                    "weight_decay": args.weight_decay,
-                    "lr": args.lr,
-                    "hidden_dims": hidden_dims,
-                    "target_transform": args.target_transform,
+                    "input_dim": 383,
+                    "global_params": ["DLNTDR_1", "DLNNDR_1", "KY", "NU_EE", "MASS_1"],
+                    "hidden_dims": [512, 256, 128],
+                    "dropout": 0.2,
+                    "lr": 5e-4,
+                    "weight_decay": 0.01,
+                    "target_transform": "raw",
                     "ensemble_size": args.ensemble_size,
                 },
             )
 
         kfold_result = run_kfold(
-            features, targets, experiment_groups, mc, tc, device, wandb_run
+            features, targets, experiment_groups, metadata, mc, tc, device, wandb_run
         )
 
         print(f"\nK-fold mean_rel_l2: {kfold_result['mean_rel_l2']:.4f} "
@@ -241,25 +246,27 @@ def main():
 
         save_dir = os.path.join(config.paths.checkpoint_dir, "ensemble")
         config_dict = {
-            "dropout": args.dropout,
-            "weight_decay": args.weight_decay,
-            "lr": args.lr,
-            "hidden_dims": hidden_dims,
-            "target_transform": args.target_transform,
+            "input_dim": 383,
+            "global_params": ["DLNTDR_1", "DLNNDR_1", "KY", "NU_EE", "MASS_1"],
+            "hidden_dims": [512, 256, 128],
+            "dropout": 0.2,
+            "lr": 5e-4,
+            "weight_decay": 0.01,
+            "target_transform": "raw",
             "ensemble_size": args.ensemble_size,
         }
         save_ensemble(models, scaler, config_dict, save_dir)
 
         # Ensemble predictions on training data (sanity check)
         mean_pred, std_pred = predict_ensemble(
-            models, features, scaler, args.target_transform, tc.epsilon, device
+            models, features, scaler, tc.target_transform, tc.epsilon, device
         )
         ensemble_uncertainty_plot(mean_pred, std_pred, targets,
                                   os.path.join(plot_dir, "ensemble_uncertainty.png"))
 
         # Summary
         summarize_results(
-            kfold_result, config_dict, tglf_comp,
+            kfold_result, config_dict, tglf_comp, metadata,
             os.path.join(config.paths.checkpoint_dir, "results_summary.json"),
         )
 

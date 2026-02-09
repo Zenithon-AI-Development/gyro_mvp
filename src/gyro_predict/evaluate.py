@@ -207,6 +207,7 @@ def summarize_results(
     kfold_results: dict,
     best_config: dict,
     tglf_comparison: dict,
+    metadata,
     save_path: str,
 ) -> dict:
     """Create and save a JSON summary of all results."""
@@ -216,6 +217,8 @@ def summarize_results(
         "kfold_std_rel_l2": kfold_results["std_rel_l2"],
         "oof_metrics": kfold_results["oof_metrics"],
         "tglf_comparison": tglf_comparison,
+        "fold_details": kfold_results.get("fold_details", []),
+        "all_runs": metadata["folder_name"].tolist() if hasattr(metadata, "tolist") else list(metadata["folder_name"]),
     }
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
