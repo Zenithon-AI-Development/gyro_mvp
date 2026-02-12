@@ -6,10 +6,13 @@ import torch.nn as nn
 
 
 class FluxMLP(nn.Module):
-    """Flat MLP mapping 378 TGLF features to 2 flux targets.
+    """Flat MLP mapping TGLF features to 2 flux targets.
 
     Architecture:
-        BatchNorm1d -> [Linear -> ReLU -> Dropout] x N_layers -> Linear(n_outputs)
+        BatchNorm1d -> [Linear -> ReLU -> Dropout] x N_layers -> Linear(n_outputs) -> [Softplus]
+
+    The optional Softplus activation ensures outputs are always positive (Q > 0),
+    which is physically correct for energy fluxes.
     """
 
     def __init__(
@@ -18,11 +21,21 @@ class FluxMLP(nn.Module):
         hidden_dims: List[int] = None,
         dropout: float = 0.3,
         n_outputs: int = 2,
+        use_softplus: bool = True,
     ):
+        """
+        Args:
+            input_dim: Input feature dimension (378 for TGLF-only, 378+N with global params)
+            hidden_dims: List of hidden layer sizes
+            dropout: Dropout probability
+            n_outputs: Number of outputs (2 for Q_electron, Q_ion)
+            use_softplus: If True, apply Softplus to output to ensure Q > 0
+        """
         super().__init__()
         if hidden_dims is None:
             hidden_dims = [256, 128, 64]
 
+        self.use_softplus = use_softplus
         self.input_bn = nn.BatchNorm1d(input_dim)
 
         layers = []
@@ -38,6 +51,12 @@ class FluxMLP(nn.Module):
         layers.append(nn.Linear(in_dim, n_outputs))
         self.network = nn.Sequential(*layers)
 
+        if use_softplus:
+            self.output_activation = nn.Softplus()
+
     def forward(self, x):
         x = self.input_bn(x)
-        return self.network(x)
+        x = self.network(x)
+        if self.use_softplus:
+            x = self.output_activation(x)
+        return x

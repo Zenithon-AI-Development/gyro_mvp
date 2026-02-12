@@ -75,6 +75,7 @@ def train_one_model(
         hidden_dims=model_config.hidden_dims,
         dropout=model_config.dropout,
         n_outputs=model_config.n_outputs,
+        use_softplus=model_config.use_softplus,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -394,6 +395,7 @@ def train_ensemble(
             hidden_dims=model_config.hidden_dims,
             dropout=model_config.dropout,
             n_outputs=model_config.n_outputs,
+            use_softplus=model_config.use_softplus,
         ).to(device)
 
         optimizer = torch.optim.AdamW(

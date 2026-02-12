@@ -59,6 +59,10 @@ def parse_args():
                         help="CSV file to load (in csvs/ dir)")
     parser.add_argument("--global_params", type=str, default="",
                         help="Comma-separated global param column names (empty=TGLF-only)")
+    parser.add_argument("--use_softplus", action="store_true", default=True,
+                        help="Apply Softplus to output to ensure Q > 0 (default: True)")
+    parser.add_argument("--no_softplus", dest="use_softplus", action="store_false",
+                        help="Disable Softplus output activation")
 
     # WandB
     parser.add_argument("--wandb_entity", default="PLACEHOLDER_ENTITY")
@@ -201,6 +205,7 @@ def main():
             input_dim=input_dim,
             hidden_dims=hidden_dims,
             dropout=args.dropout,
+            use_softplus=args.use_softplus,
         )
         tc = TrainConfig(
             lr=args.lr,
@@ -267,6 +272,7 @@ def main():
             "global_params": global_param_columns,
             "hidden_dims": hidden_dims,
             "dropout": args.dropout,
+            "use_softplus": mc.use_softplus,
             "lr": args.lr,
             "weight_decay": args.weight_decay,
             "target_transform": args.target_transform,
@@ -293,12 +299,18 @@ def main():
     # === MODE: eval ===
     elif args.mode == "eval":
         print("\n=== EVALUATION MODE ===")
-        # Load ensemble from checkpoint_dir/ensemble/
+        # Load ensemble from checkpoint_dir/ensemble/ or directly from checkpoint_dir
         import json
         import pickle
         from .model import FluxMLP
 
+        # Try checkpoint_dir/ensemble first (new structure), then checkpoint_dir directly (V1 structure)
         ensemble_dir = os.path.join(config.paths.checkpoint_dir, "ensemble")
+        if not os.path.exists(os.path.join(ensemble_dir, "model_0.pt")):
+            # Fall back to checkpoint_dir directly (V1 model structure)
+            ensemble_dir = config.paths.checkpoint_dir
+            print(f"Using checkpoint_dir directly: {ensemble_dir}")
+
         config_json_path = os.path.join(ensemble_dir, "config.json")
 
         # Load saved model config
@@ -334,6 +346,7 @@ def main():
                 input_dim=model_input_dim,
                 hidden_dims=hidden_dims,
                 dropout=saved_config["dropout"],
+                use_softplus=saved_config.get("use_softplus", False),  # Default False for backward compat
             ).to(device)
             model.load_state_dict(
                 torch.load(os.path.join(ensemble_dir, f"model_{i}.pt"),

@@ -36,6 +36,7 @@ class ModelConfig:
     hidden_dims: List[int] = field(default_factory=lambda: [256, 128, 64])
     dropout: float = 0.3
     n_outputs: int = 2
+    use_softplus: bool = True  # Apply Softplus to output to ensure Q > 0
 
 
 @dataclass
