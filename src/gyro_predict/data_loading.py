@@ -9,7 +9,7 @@ Target ordering: [Q_electron, Q_ion]
 
 import os
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Tuple
 
 import h5py
 import numpy as np
@@ -19,13 +19,72 @@ from tqdm import tqdm
 from .features import build_feature_vector
 
 
+def parse_experiment_from_run_name(run_name: str) -> str:
+    """Derive experiment group from run_name.
+
+    Examples:
+        "2019_03-isotope_d_an2_q1_filtered" -> "isotope_d"
+        "r90_dlntdr_dlt1_filtered" -> "r90_scans"
+        "STD_AC_a1_filtered" -> "STD_AC"
+        "2020_09-rmin_r025_filtered" -> "rmin"
+    """
+    name = run_name.replace('_filtered', '')
+
+    if 'isotope_d' in name:
+        return 'isotope_d'
+    elif 'isotope_h' in name:
+        return 'isotope_h'
+    elif 'isotope_t' in name:
+        return 'isotope_t'
+    elif 'r90' in name:
+        return 'r90_scans'
+    elif 'r70_ge' in name:
+        return 'r70_ge'
+    elif 'Belli' in name:
+        return 'Belli_Lmode_iso'
+    elif 'rmin' in name:
+        return 'rmin'
+    elif 'theta' in name:
+        return 'theta_diagnostic'
+    elif 'nuei_lor' in name:
+        return 'nuei_lor'
+    elif 'garyshift' in name:
+        return 'garyshift'
+    elif 'exb_2res' in name:
+        return 'exb_2res'
+    elif 'exb_kappa' in name:
+        return 'exb_kappa'
+    elif 'exb_shift' in name:
+        return 'exb_shift'
+    elif 'STD_AC' in name:
+        return 'STD_AC'
+    elif 'STD_A' in name:
+        return 'STD_A'
+    elif 'STD_gamma' in name:
+        return 'STD_gamma'
+    else:
+        return 'other'
+
+
 def load_run_list(csv_path: str) -> pd.DataFrame:
     """Load validated run list from CSV.
+
+    Handles both old format (folder_name column) and new format (run_name column).
+    If 'experiment' column is missing, derives it from run_name.
 
     Returns:
         DataFrame with at least 'folder_name' and 'experiment' columns.
     """
     df = pd.read_csv(csv_path)
+
+    # Handle column naming: old CSV has 'folder_name', new CSV has 'run_name'
+    if 'folder_name' not in df.columns and 'run_name' in df.columns:
+        df['folder_name'] = df['run_name']
+
+    # Derive experiment column if missing
+    if 'experiment' not in df.columns:
+        df['experiment'] = df['folder_name'].apply(parse_experiment_from_run_name)
+
     return df
 
 
@@ -71,16 +130,19 @@ def load_tglf_conditioning(npz_path: str) -> Dict[str, np.ndarray]:
 
 
 def load_all_data(
-    data_dir: str, run_list: pd.DataFrame
+    data_dir: str, run_list: pd.DataFrame, global_param_columns: List[str] = None
 ) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-    """Load features and targets for all 105 validated runs.
+    """Load features and targets for runs.
 
     Args:
         data_dir: Path to root data directory containing run folders.
         run_list: DataFrame with 'folder_name' column.
+        global_param_columns: List of column names to extract as global params.
+                              If None or empty, returns TGLF-only features (378 dims).
+                              Otherwise, appends these params to get (378 + len) dims.
 
     Returns:
-        features: np.ndarray of shape (N, 383) = 378 TGLF + 5 global params
+        features: np.ndarray of shape (N, 378) or (N, 378+len(global_param_columns))
         targets: np.ndarray of shape (N, 2) = [Q_electron, Q_ion]
         metadata: DataFrame with folder_name, experiment, and targets
     """
@@ -113,19 +175,14 @@ def load_all_data(
         raw_tglf = load_tglf_conditioning(npz_path)
         feat_tglf = build_feature_vector(raw_tglf)  # (378,)
 
-        # Extract 5 global parameters from CSV row
-        global_params = np.array([
-            float(row['DLNTDR_1']),
-            float(row['DLNNDR_1']),
-            float(row['KY']),
-            float(row['NU_EE']),
-            float(row['MASS_1']),
-        ], dtype=np.float64)
+        # Optionally append global parameters from CSV
+        if global_param_columns:
+            global_params = np.array([float(row[col]) for col in global_param_columns], dtype=np.float64)
+            feat_full = np.concatenate([feat_tglf, global_params])
+        else:
+            feat_full = feat_tglf  # TGLF-only, 378 dims
 
-        # Concatenate TGLF + globals
-        feat_full = np.concatenate([feat_tglf, global_params])  # (383,)
         features_list.append(feat_full)
-
         loaded_folders.append(folder_name)
 
     if skipped:

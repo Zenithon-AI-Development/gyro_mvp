@@ -22,7 +22,12 @@ class FeatureConfig:
     n_fields: int = 2
     energy_flux_idx: int = 1  # index into flux_type dimension
     agg_funcs: List[str] = field(default_factory=lambda: ["max", "sum", "mean", "std"])
-    total_features: int = 383  # 378 TGLF + 5 global params
+    global_param_columns: List[str] = field(default_factory=list)
+
+    @property
+    def total_features(self) -> int:
+        """Compute total features: 378 TGLF + len(global_param_columns)."""
+        return 378 + len(self.global_param_columns)
 
 
 @dataclass

@@ -54,6 +54,12 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--seed", type=int, default=42)
 
+    # CSV and feature options
+    parser.add_argument("--csv_file", type=str, default="validated_parameters_cleaned.csv",
+                        help="CSV file to load (in csvs/ dir)")
+    parser.add_argument("--global_params", type=str, default="",
+                        help="Comma-separated global param column names (empty=TGLF-only)")
+
     # WandB
     parser.add_argument("--wandb_entity", default="PLACEHOLDER_ENTITY")
     parser.add_argument("--wandb_project", default="PLACEHOLDER_PROJECT")
@@ -85,12 +91,20 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # --- Load data ---
-    csv_path = os.path.join(config.paths.csv_dir, config.paths.validated_csv)
-    run_list = load_run_list(csv_path)
-    print(f"Run list: {len(run_list)} entries")
+    # --- Parse global params ---
+    global_param_columns = [x.strip() for x in args.global_params.split(",") if x.strip()] if args.global_params else []
+    config.features.global_param_columns = global_param_columns
+    input_dim = 378 + len(global_param_columns)
+    print(f"Feature config: 378 TGLF + {len(global_param_columns)} global params = {input_dim} dims")
+    if global_param_columns:
+        print(f"Global params: {global_param_columns}")
 
-    features, targets, metadata = load_all_data(config.paths.data_dir, run_list)
+    # --- Load data ---
+    csv_path = os.path.join(config.paths.csv_dir, args.csv_file)
+    run_list = load_run_list(csv_path)
+    print(f"Run list: {len(run_list)} entries from {args.csv_file}")
+
+    features, targets, metadata = load_all_data(config.paths.data_dir, run_list, global_param_columns)
     experiment_groups = metadata["experiment"].values
     print(f"Features: {features.shape}, Targets: {targets.shape}")
     print(f"Experiment groups: {np.unique(experiment_groups, return_counts=True)}")
@@ -176,19 +190,22 @@ def main():
 
     # === MODE: train ===
     elif args.mode == "train":
-        print("\n=== TRAINING V2 WITH BEST V1 CONFIG (383-dim inputs) ===")
-        print("Hyperparameters: [512, 256, 128], dropout=0.2, lr=5e-4, weight_decay=0.01, raw transform")
+        print(f"\n=== TRAINING WITH {input_dim}-dim inputs ===")
+        print(f"Hyperparameters: {args.hidden_dims}, dropout={args.dropout}, lr={args.lr}, "
+              f"weight_decay={args.weight_decay}, {args.target_transform} transform")
 
-        # Best V1 hyperparameters (hardcoded from search_results.csv)
+        # Parse hidden dims from CLI
+        hidden_dims = [int(x) for x in args.hidden_dims.split(",")]
+
         mc = ModelConfig(
-            input_dim=383,  # 378 TGLF + 5 global params
-            hidden_dims=[512, 256, 128],
-            dropout=0.2,
+            input_dim=input_dim,
+            hidden_dims=hidden_dims,
+            dropout=args.dropout,
         )
         tc = TrainConfig(
-            lr=5e-4,
-            weight_decay=0.01,
-            target_transform="raw",
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            target_transform=args.target_transform,
             epochs=config.train.epochs,
             patience=config.train.patience,
             n_folds=config.train.n_folds,
@@ -203,16 +220,16 @@ def main():
             wandb_run = wandb.init(
                 entity=config.wandb.entity,
                 project=config.wandb.project,
-                group="v2-mlp-global-params",
-                name="v2_best_config_383dims",
+                group=f"mlp-{input_dim}dims",
+                name=f"train_{input_dim}dims",
                 config={
-                    "input_dim": 383,
-                    "global_params": ["DLNTDR_1", "DLNNDR_1", "KY", "NU_EE", "MASS_1"],
-                    "hidden_dims": [512, 256, 128],
-                    "dropout": 0.2,
-                    "lr": 5e-4,
-                    "weight_decay": 0.01,
-                    "target_transform": "raw",
+                    "input_dim": input_dim,
+                    "global_params": global_param_columns,
+                    "hidden_dims": hidden_dims,
+                    "dropout": args.dropout,
+                    "lr": args.lr,
+                    "weight_decay": args.weight_decay,
+                    "target_transform": args.target_transform,
                     "ensemble_size": args.ensemble_size,
                 },
             )
@@ -246,13 +263,13 @@ def main():
 
         save_dir = os.path.join(config.paths.checkpoint_dir, "ensemble")
         config_dict = {
-            "input_dim": 383,
-            "global_params": ["DLNTDR_1", "DLNNDR_1", "KY", "NU_EE", "MASS_1"],
-            "hidden_dims": [512, 256, 128],
-            "dropout": 0.2,
-            "lr": 5e-4,
-            "weight_decay": 0.01,
-            "target_transform": "raw",
+            "input_dim": input_dim,
+            "global_params": global_param_columns,
+            "hidden_dims": hidden_dims,
+            "dropout": args.dropout,
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+            "target_transform": args.target_transform,
             "ensemble_size": args.ensemble_size,
         }
         save_ensemble(models, scaler, config_dict, save_dir)
@@ -282,8 +299,30 @@ def main():
         from .model import FluxMLP
 
         ensemble_dir = os.path.join(config.paths.checkpoint_dir, "ensemble")
-        with open(os.path.join(ensemble_dir, "config.json")) as f:
-            saved_config = json.load(f)
+        config_json_path = os.path.join(ensemble_dir, "config.json")
+
+        # Load saved model config
+        if os.path.exists(config_json_path):
+            with open(config_json_path) as f:
+                saved_config = json.load(f)
+            model_input_dim = saved_config.get("input_dim", 378)
+            print(f"Loaded model config: input_dim={model_input_dim}")
+        else:
+            # Fallback: infer from first model weight matrix
+            model_path = os.path.join(ensemble_dir, "model_0.pt")
+            checkpoint = torch.load(model_path, map_location=device)
+            model_input_dim = checkpoint['fc1.weight'].shape[1]
+            print(f"Inferred input_dim={model_input_dim} from model weights")
+            saved_config = {"input_dim": model_input_dim, "hidden_dims": [512, 256, 128], "dropout": 0.2}
+
+        # Verify data features match model input_dim
+        if features.shape[1] != model_input_dim:
+            print(f"ERROR: Feature dimension mismatch!")
+            print(f"  Data features: {features.shape[1]} dims")
+            print(f"  Model expects: {model_input_dim} dims")
+            print(f"  Loaded with global_params={global_param_columns}")
+            raise ValueError(f"Feature dimension mismatch: {features.shape[1]} != {model_input_dim}")
+
         with open(os.path.join(ensemble_dir, "scaler.pkl"), "rb") as f:
             scaler = pickle.load(f)
 
@@ -292,7 +331,7 @@ def main():
         i = 0
         while os.path.exists(os.path.join(ensemble_dir, f"model_{i}.pt")):
             model = FluxMLP(
-                input_dim=config.features.total_features,
+                input_dim=model_input_dim,
                 hidden_dims=hidden_dims,
                 dropout=saved_config["dropout"],
             ).to(device)
@@ -304,7 +343,7 @@ def main():
             models.append(model)
             i += 1
 
-        print(f"Loaded {len(models)} ensemble members")
+        print(f"Loaded {len(models)} ensemble members, input_dim={model_input_dim}")
 
         tt = saved_config["target_transform"]
         eps = config.train.epsilon
@@ -327,8 +366,13 @@ def main():
         ensemble_uncertainty_plot(mean_pred, std_pred, targets,
                                   os.path.join(plot_dir, "ensemble_uncertainty.png"))
 
+        # Optional TGLF baseline comparison (skip if flux_comparison.csv doesn't exist)
         flux_csv = os.path.join(config.paths.csv_dir, config.paths.flux_comparison_csv)
-        compare_to_tglf_baseline(mean_pred, targets, flux_csv)
+        if os.path.exists(flux_csv):
+            print("\n=== TGLF Baseline Comparison ===")
+            compare_to_tglf_baseline(mean_pred, targets, flux_csv)
+        else:
+            print(f"\nSkipping TGLF baseline comparison ({config.paths.flux_comparison_csv} not found)")
 
 
 if __name__ == "__main__":
