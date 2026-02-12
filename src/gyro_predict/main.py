@@ -63,6 +63,9 @@ def parse_args():
                         help="Apply Softplus to output to ensure Q > 0 (default: True)")
     parser.add_argument("--no_softplus", dest="use_softplus", action="store_false",
                         help="Disable Softplus output activation")
+    parser.add_argument("--split_column", type=str, default="",
+                        help="Column in CSV for train/ood split. "
+                             "If set, trains on 'train' rows, evaluates on 'ood' rows.")
 
     # WandB
     parser.add_argument("--wandb_entity", default="PLACEHOLDER_ENTITY")
@@ -112,6 +115,32 @@ def main():
     experiment_groups = metadata["experiment"].values
     print(f"Features: {features.shape}, Targets: {targets.shape}")
     print(f"Experiment groups: {np.unique(experiment_groups, return_counts=True)}")
+
+    # --- Split data if split_column is specified ---
+    split_column = args.split_column.strip() if args.split_column else ""
+    train_mask = None
+    ood_mask = None
+    ood_features = ood_targets = ood_metadata = ood_experiment_groups = None
+
+    if split_column and split_column in metadata.columns:
+        train_mask = metadata[split_column].values == "train"
+        ood_mask = metadata[split_column].values == "ood"
+        print(f"\nSplit column '{split_column}': {train_mask.sum()} train, {ood_mask.sum()} OOD")
+
+        # Store OOD subset before overwriting
+        ood_features = features[ood_mask]
+        ood_targets = targets[ood_mask]
+        ood_metadata = metadata[ood_mask].reset_index(drop=True)
+        ood_experiment_groups = ood_metadata["experiment"].values
+
+        # Overwrite with train-only (all downstream code uses these unmodified)
+        features = features[train_mask]
+        targets = targets[train_mask]
+        metadata = metadata[train_mask].reset_index(drop=True)
+        experiment_groups = metadata["experiment"].values
+        print(f"Training subset: {features.shape}, OOD subset: {ood_features.shape}")
+    elif split_column:
+        print(f"WARNING: split_column '{split_column}' not found in metadata")
 
     # --- Init WandB ---
     if config.wandb.enabled:
@@ -295,6 +324,44 @@ def main():
 
         if wandb_run is not None:
             wandb_run.finish()
+
+        # === OOD EVALUATION (if split_column was used) ===
+        if split_column and ood_features is not None and len(ood_features) > 0:
+            print(f"\n=== OOD EVALUATION ({len(ood_features)} runs) ===")
+
+            ood_mean_pred, ood_std_pred = predict_ensemble(
+                models, ood_features, scaler, tc.target_transform, tc.epsilon, device
+            )
+
+            from .loss import compute_metrics as _compute_metrics
+            ood_metrics = _compute_metrics(ood_mean_pred, ood_targets, tc.epsilon)
+            print(f"OOD metrics: {ood_metrics}")
+
+            # OOD plots (separate directory)
+            ood_plot_dir = os.path.join(config.paths.checkpoint_dir, "plots_ood")
+            parity_plot(ood_mean_pred, ood_targets, ood_experiment_groups,
+                        os.path.join(ood_plot_dir, "parity_ood.png"))
+            error_distribution_plot(ood_mean_pred, ood_targets,
+                                    os.path.join(ood_plot_dir, "error_dist_ood.png"))
+            error_by_regime(ood_mean_pred, ood_targets, ood_experiment_groups,
+                            os.path.join(ood_plot_dir, "error_by_regime_ood.png"))
+            ensemble_uncertainty_plot(ood_mean_pred, ood_std_pred, ood_targets,
+                                      os.path.join(ood_plot_dir, "ensemble_uncertainty_ood.png"))
+
+            # Save OOD summary JSON
+            import json as _json
+            ood_summary = {
+                "split": "ood",
+                "n_runs": len(ood_features),
+                "metrics": ood_metrics,
+                "run_names": ood_metadata["folder_name"].tolist(),
+                "config": config_dict,
+            }
+            ood_path = os.path.join(config.paths.checkpoint_dir, "ood_results_summary.json")
+            os.makedirs(os.path.dirname(ood_path), exist_ok=True)
+            with open(ood_path, "w") as f:
+                _json.dump(ood_summary, f, indent=2)
+            print(f"OOD results saved to {ood_path}")
 
     # === MODE: eval ===
     elif args.mode == "eval":
