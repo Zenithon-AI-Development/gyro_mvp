@@ -16,6 +16,7 @@ from .evaluate import (
     parity_plot,
     summarize_results,
 )
+from .model import create_model
 from .train import (
     predict_ensemble,
     run_hyperparameter_search,
@@ -67,12 +68,23 @@ def parse_args():
                         help="Column in CSV for train/ood split. "
                              "If set, trains on 'train' rows, evaluates on 'ood' rows.")
 
+    # Model architecture
+    parser.add_argument("--model_type", type=str, default="mlp",
+                        choices=["mlp", "film", "hadamard", "bilinear"],
+                        help="Model architecture: mlp (flat concat), film (FiLM conditioning), "
+                             "hadamard (dual-head element-wise), bilinear (dual-head bilinear)")
+
     # WandB
     parser.add_argument("--wandb_entity", default="PLACEHOLDER_ENTITY")
     parser.add_argument("--wandb_project", default="PLACEHOLDER_PROJECT")
     parser.add_argument("--no_wandb", action="store_true")
 
     return parser.parse_args()
+
+
+def _count_parameters(model):
+    """Count total trainable parameters."""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 def main():
@@ -101,8 +113,11 @@ def main():
     # --- Parse global params ---
     global_param_columns = [x.strip() for x in args.global_params.split(",") if x.strip()] if args.global_params else []
     config.features.global_param_columns = global_param_columns
-    input_dim = 378 + len(global_param_columns)
-    print(f"Feature config: 378 TGLF + {len(global_param_columns)} global params = {input_dim} dims")
+    param_dim = len(global_param_columns)
+    tglf_dim = 378
+    input_dim = tglf_dim + param_dim
+    print(f"Feature config: {tglf_dim} TGLF + {param_dim} global params = {input_dim} dims")
+    print(f"Model type: {args.model_type}")
     if global_param_columns:
         print(f"Global params: {global_param_columns}")
 
@@ -223,7 +238,7 @@ def main():
 
     # === MODE: train ===
     elif args.mode == "train":
-        print(f"\n=== TRAINING WITH {input_dim}-dim inputs ===")
+        print(f"\n=== TRAINING WITH {input_dim}-dim inputs ({args.model_type}) ===")
         print(f"Hyperparameters: {args.hidden_dims}, dropout={args.dropout}, lr={args.lr}, "
               f"weight_decay={args.weight_decay}, {args.target_transform} transform")
 
@@ -235,6 +250,8 @@ def main():
             hidden_dims=hidden_dims,
             dropout=args.dropout,
             use_softplus=args.use_softplus,
+            model_type=args.model_type,
+            param_dim=param_dim,
         )
         tc = TrainConfig(
             lr=args.lr,
@@ -247,6 +264,19 @@ def main():
             seed=config.train.seed,
         )
 
+        # Count parameters for a dummy model
+        dummy_model = create_model(
+            model_type=args.model_type,
+            tglf_dim=tglf_dim,
+            param_dim=param_dim,
+            hidden_dims=hidden_dims,
+            dropout=args.dropout,
+            use_softplus=args.use_softplus,
+        )
+        num_params = _count_parameters(dummy_model)
+        print(f"Model parameters: {num_params:,}")
+        del dummy_model
+
         # K-fold evaluation
         wandb_run = None
         if config.wandb.enabled:
@@ -254,10 +284,13 @@ def main():
             wandb_run = wandb.init(
                 entity=config.wandb.entity,
                 project=config.wandb.project,
-                group=f"mlp-{input_dim}dims",
-                name=f"train_{input_dim}dims",
+                group=f"{args.model_type}-{input_dim}dims",
+                name=f"train_{args.model_type}_{input_dim}dims",
                 config={
+                    "model_type": args.model_type,
                     "input_dim": input_dim,
+                    "tglf_dim": tglf_dim,
+                    "param_dim": param_dim,
                     "global_params": global_param_columns,
                     "hidden_dims": hidden_dims,
                     "dropout": args.dropout,
@@ -265,6 +298,7 @@ def main():
                     "weight_decay": args.weight_decay,
                     "target_transform": args.target_transform,
                     "ensemble_size": args.ensemble_size,
+                    "num_params": num_params,
                 },
             )
 
@@ -274,6 +308,20 @@ def main():
 
         print(f"\nK-fold mean_rel_l2: {kfold_result['mean_rel_l2']:.4f} "
               f"+/- {kfold_result['std_rel_l2']:.4f}")
+
+        # Log k-fold metrics to wandb
+        if wandb_run is not None:
+            oof_m = kfold_result["oof_metrics"]
+            wandb_run.summary.update({
+                "kfold/rel_l2_mean": kfold_result["mean_rel_l2"],
+                "kfold/rel_l2_std": kfold_result["std_rel_l2"],
+                "kfold/mape_electron": oof_m["mape_electron"],
+                "kfold/mape_ion": oof_m["mape_ion"],
+                "kfold/mae_electron": oof_m["mae_electron"],
+                "kfold/mae_ion": oof_m["mae_ion"],
+                "kfold/rmse_electron": oof_m["rmse_electron"],
+                "kfold/rmse_ion": oof_m["rmse_ion"],
+            })
 
         # Plots
         plot_dir = os.path.join(config.paths.checkpoint_dir, "plots")
@@ -297,7 +345,10 @@ def main():
 
         save_dir = os.path.join(config.paths.checkpoint_dir, "ensemble")
         config_dict = {
+            "model_type": args.model_type,
             "input_dim": input_dim,
+            "tglf_dim": tglf_dim,
+            "param_dim": param_dim,
             "global_params": global_param_columns,
             "hidden_dims": hidden_dims,
             "dropout": args.dropout,
@@ -306,12 +357,17 @@ def main():
             "weight_decay": args.weight_decay,
             "target_transform": args.target_transform,
             "ensemble_size": args.ensemble_size,
+            "num_params": num_params,
         }
         save_ensemble(models, scaler, config_dict, save_dir)
 
+        # Determine tglf_dim for predict_ensemble
+        ens_tglf_dim = tglf_dim if args.model_type != "mlp" and param_dim > 0 else None
+
         # Ensemble predictions on training data (sanity check)
         mean_pred, std_pred = predict_ensemble(
-            models, features, scaler, tc.target_transform, tc.epsilon, device
+            models, features, scaler, tc.target_transform, tc.epsilon, device,
+            tglf_dim=ens_tglf_dim,
         )
         ensemble_uncertainty_plot(mean_pred, std_pred, targets,
                                   os.path.join(plot_dir, "ensemble_uncertainty.png"))
@@ -330,12 +386,48 @@ def main():
             print(f"\n=== OOD EVALUATION ({len(ood_features)} runs) ===")
 
             ood_mean_pred, ood_std_pred = predict_ensemble(
-                models, ood_features, scaler, tc.target_transform, tc.epsilon, device
+                models, ood_features, scaler, tc.target_transform, tc.epsilon, device,
+                tglf_dim=ens_tglf_dim,
             )
 
             from .loss import compute_metrics as _compute_metrics
             ood_metrics = _compute_metrics(ood_mean_pred, ood_targets, tc.epsilon)
             print(f"OOD metrics: {ood_metrics}")
+
+            # Compute per-run MAPE for outlier detection
+            per_run_mape = []
+            for i in range(len(ood_targets)):
+                run_metrics = _compute_metrics(
+                    ood_mean_pred[i:i+1], ood_targets[i:i+1], tc.epsilon)
+                avg_mape = (run_metrics["mape_electron"] + run_metrics["mape_ion"]) / 2
+                per_run_mape.append(avg_mape)
+            max_mape = max(per_run_mape) if per_run_mape else 0.0
+            print(f"OOD max single-run MAPE: {max_mape:.1f}%")
+
+            # Log OOD metrics to wandb
+            if config.wandb.enabled:
+                import wandb
+                ood_wandb_run = wandb.init(
+                    entity=config.wandb.entity,
+                    project=config.wandb.project,
+                    group=f"{args.model_type}-{input_dim}dims",
+                    name=f"ood_{args.model_type}_{input_dim}dims",
+                    config=config_dict,
+                )
+                ood_wandb_run.summary.update({
+                    "ood/rel_l2_mean": ood_metrics["rel_l2_mean"],
+                    "ood/rel_l2_electron": ood_metrics["rel_l2_electron"],
+                    "ood/rel_l2_ion": ood_metrics["rel_l2_ion"],
+                    "ood/mape_electron": ood_metrics["mape_electron"],
+                    "ood/mape_ion": ood_metrics["mape_ion"],
+                    "ood/mae_electron": ood_metrics["mae_electron"],
+                    "ood/mae_ion": ood_metrics["mae_ion"],
+                    "ood/rmse_electron": ood_metrics["rmse_electron"],
+                    "ood/rmse_ion": ood_metrics["rmse_ion"],
+                    "ood/n_runs": len(ood_features),
+                    "ood/max_mape": max_mape,
+                })
+                ood_wandb_run.finish()
 
             # OOD plots (separate directory)
             ood_plot_dir = os.path.join(config.paths.checkpoint_dir, "plots_ood")
@@ -354,6 +446,8 @@ def main():
                 "split": "ood",
                 "n_runs": len(ood_features),
                 "metrics": ood_metrics,
+                "max_mape": max_mape,
+                "per_run_mape": per_run_mape,
                 "run_names": ood_metadata["folder_name"].tolist(),
                 "config": config_dict,
             }
@@ -369,7 +463,7 @@ def main():
         # Load ensemble from checkpoint_dir/ensemble/ or directly from checkpoint_dir
         import json
         import pickle
-        from .model import FluxMLP
+        from .model import FluxMLP, create_model as _create_model
 
         # Try checkpoint_dir/ensemble first (new structure), then checkpoint_dir directly (V1 structure)
         ensemble_dir = os.path.join(config.paths.checkpoint_dir, "ensemble")
@@ -385,7 +479,10 @@ def main():
             with open(config_json_path) as f:
                 saved_config = json.load(f)
             model_input_dim = saved_config.get("input_dim", 378)
-            print(f"Loaded model config: input_dim={model_input_dim}")
+            saved_model_type = saved_config.get("model_type", "mlp")
+            saved_param_dim = saved_config.get("param_dim", 0)
+            saved_tglf_dim = saved_config.get("tglf_dim", model_input_dim)
+            print(f"Loaded model config: model_type={saved_model_type}, input_dim={model_input_dim}")
         else:
             # Fallback: infer from first model weight matrix
             model_path = os.path.join(ensemble_dir, "model_0.pt")
@@ -393,6 +490,9 @@ def main():
             model_input_dim = checkpoint['fc1.weight'].shape[1]
             print(f"Inferred input_dim={model_input_dim} from model weights")
             saved_config = {"input_dim": model_input_dim, "hidden_dims": [512, 256, 128], "dropout": 0.2}
+            saved_model_type = "mlp"
+            saved_param_dim = 0
+            saved_tglf_dim = model_input_dim
 
         # Verify data features match model input_dim
         if features.shape[1] != model_input_dim:
@@ -409,11 +509,13 @@ def main():
         models = []
         i = 0
         while os.path.exists(os.path.join(ensemble_dir, f"model_{i}.pt")):
-            model = FluxMLP(
-                input_dim=model_input_dim,
+            model = _create_model(
+                model_type=saved_model_type,
+                tglf_dim=saved_tglf_dim,
+                param_dim=saved_param_dim,
                 hidden_dims=hidden_dims,
                 dropout=saved_config["dropout"],
-                use_softplus=saved_config.get("use_softplus", False),  # Default False for backward compat
+                use_softplus=saved_config.get("use_softplus", False),
             ).to(device)
             model.load_state_dict(
                 torch.load(os.path.join(ensemble_dir, f"model_{i}.pt"),
@@ -423,12 +525,14 @@ def main():
             models.append(model)
             i += 1
 
-        print(f"Loaded {len(models)} ensemble members, input_dim={model_input_dim}")
+        print(f"Loaded {len(models)} ensemble members, model_type={saved_model_type}, input_dim={model_input_dim}")
 
         tt = saved_config["target_transform"]
         eps = config.train.epsilon
+        eval_tglf_dim = saved_tglf_dim if saved_model_type != "mlp" and saved_param_dim > 0 else None
+
         mean_pred, std_pred = predict_ensemble(
-            models, features, scaler, tt, eps, device
+            models, features, scaler, tt, eps, device, tglf_dim=eval_tglf_dim,
         )
 
         from .loss import compute_metrics as _compute_metrics

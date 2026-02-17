@@ -37,6 +37,8 @@ class ModelConfig:
     dropout: float = 0.3
     n_outputs: int = 2
     use_softplus: bool = True  # Apply Softplus to output to ensure Q > 0
+    model_type: str = "mlp"   # mlp, film, hadamard, bilinear
+    param_dim: int = 0        # 0 for TGLF-only, >0 for dual-input models
 
 
 @dataclass

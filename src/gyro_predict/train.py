@@ -19,13 +19,14 @@ from tqdm import tqdm
 
 from .config import Config, ModelConfig, TrainConfig
 from .dataset import (
+    DualInputFluxDataset,
     FluxDataset,
     apply_target_transform,
     invert_target_transform,
     make_fold_loaders,
 )
 from .loss import RelativeL2Loss, compute_metrics
-from .model import FluxMLP
+from .model import FluxMLP, create_model
 
 
 def set_seed(seed: int):
@@ -47,6 +48,37 @@ def _get_loss_fn(target_transform: str, epsilon: float) -> nn.Module:
         return nn.MSELoss()
 
 
+def _model_forward(model, batch, device):
+    """Dispatch forward call based on model type (single vs dual input).
+
+    Returns (predictions, targets_on_device).
+    """
+    if getattr(model, 'dual_input', False):
+        x_tglf, x_params, y = batch
+        x_tglf, x_params, y = x_tglf.to(device), x_params.to(device), y.to(device)
+        pred = model(x_tglf, x_params)
+    else:
+        x, y = batch
+        x, y = x.to(device), y.to(device)
+        pred = model(x)
+    return pred, y
+
+
+def _model_predict(model, batch, device):
+    """Forward pass for prediction only (no targets needed, for val/test).
+
+    Returns predictions tensor on CPU.
+    """
+    if getattr(model, 'dual_input', False):
+        x_tglf, x_params = batch[0], batch[1]
+        x_tglf, x_params = x_tglf.to(device), x_params.to(device)
+        return model(x_tglf, x_params).cpu()
+    else:
+        x = batch[0]
+        x = x.to(device)
+        return model(x).cpu()
+
+
 def train_one_model(
     train_loader: DataLoader,
     val_loader: DataLoader,
@@ -56,7 +88,7 @@ def train_one_model(
     device: torch.device,
     wandb_run=None,
 ) -> Tuple[nn.Module, dict]:
-    """Train a single MLP model with early stopping.
+    """Train a single model with early stopping.
 
     Args:
         train_loader: Training DataLoader.
@@ -70,8 +102,10 @@ def train_one_model(
     Returns:
         (best_model, metrics_dict)
     """
-    model = FluxMLP(
-        input_dim=model_config.input_dim,
+    model = create_model(
+        model_type=model_config.model_type,
+        tglf_dim=model_config.input_dim - model_config.param_dim,
+        param_dim=model_config.param_dim,
         hidden_dims=model_config.hidden_dims,
         dropout=model_config.dropout,
         n_outputs=model_config.n_outputs,
@@ -95,11 +129,10 @@ def train_one_model(
         model.train()
         train_loss_sum = 0.0
         n_batches = 0
-        for X_batch, y_batch in train_loader:
-            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+        for batch in train_loader:
             optimizer.zero_grad()
-            pred = model(X_batch)
-            loss = loss_fn(pred, y_batch)
+            pred, y = _model_forward(model, batch, device)
+            loss = loss_fn(pred, y)
             loss.backward()
             optimizer.step()
             train_loss_sum += loss.item()
@@ -113,10 +146,9 @@ def train_one_model(
         val_loss_sum = 0.0
         n_val_batches = 0
         with torch.no_grad():
-            for X_batch, y_batch in val_loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
-                pred = model(X_batch)
-                val_loss_sum += loss_fn(pred, y_batch).item()
+            for batch in val_loader:
+                pred, y = _model_forward(model, batch, device)
+                val_loss_sum += loss_fn(pred, y).item()
                 n_val_batches += 1
                 val_preds.append(pred.cpu().numpy())
 
@@ -158,9 +190,8 @@ def train_one_model(
     # Final metrics on best model
     val_preds = []
     with torch.no_grad():
-        for X_batch, _ in val_loader:
-            X_batch = X_batch.to(device)
-            val_preds.append(model(X_batch).cpu().numpy())
+        for batch in val_loader:
+            val_preds.append(_model_predict(model, batch, device).numpy())
     val_preds = np.concatenate(val_preds, axis=0)
     val_preds_original = invert_target_transform(
         val_preds, train_config.target_transform, train_config.epsilon
@@ -193,6 +224,11 @@ def run_kfold(
         n_splits=n_folds, shuffle=True, random_state=train_config.seed
     )
 
+    # Determine if dual-input splitting is needed
+    tglf_dim = None
+    if model_config.model_type != "mlp" and model_config.param_dim > 0:
+        tglf_dim = model_config.input_dim - model_config.param_dim
+
     fold_metrics = []
     fold_details = []
     oof_predictions = np.zeros_like(targets)
@@ -210,6 +246,7 @@ def run_kfold(
             train_config.target_transform,
             train_config.batch_size,
             train_config.epsilon,
+            tglf_dim=tglf_dim,
         )
 
         val_targets_original = targets[val_idx]
@@ -230,9 +267,8 @@ def run_kfold(
         model.eval()
         val_preds = []
         with torch.no_grad():
-            for X_batch, _ in val_loader:
-                X_batch = X_batch.to(device)
-                val_preds.append(model(X_batch).cpu().numpy())
+            for batch in val_loader:
+                val_preds.append(_model_predict(model, batch, device).numpy())
         val_preds = np.concatenate(val_preds, axis=0)
         oof_predictions[val_idx] = invert_target_transform(
             val_preds, train_config.target_transform, train_config.epsilon
@@ -375,6 +411,11 @@ def train_ensemble(
     Returns:
         (list_of_models, fitted_scaler)
     """
+    # Determine if dual-input splitting is needed
+    tglf_dim = None
+    if model_config.model_type != "mlp" and model_config.param_dim > 0:
+        tglf_dim = model_config.input_dim - model_config.param_dim
+
     # Fit scaler on all data
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(features)
@@ -382,7 +423,12 @@ def train_ensemble(
         targets, train_config.target_transform, train_config.epsilon
     )
 
-    ds = FluxDataset(X_scaled, y_transformed)
+    # Create dataset
+    if tglf_dim is not None:
+        ds = DualInputFluxDataset(
+            X_scaled[:, :tglf_dim], X_scaled[:, tglf_dim:], y_transformed)
+    else:
+        ds = FluxDataset(X_scaled, y_transformed)
     loader = DataLoader(ds, batch_size=train_config.batch_size, shuffle=True)
 
     models = []
@@ -390,8 +436,10 @@ def train_ensemble(
         set_seed(train_config.seed + member_idx * 100)
         print(f"  Training ensemble member {member_idx + 1}/{ensemble_size}")
 
-        model = FluxMLP(
-            input_dim=model_config.input_dim,
+        model = create_model(
+            model_type=model_config.model_type,
+            tglf_dim=model_config.input_dim - model_config.param_dim,
+            param_dim=model_config.param_dim,
             hidden_dims=model_config.hidden_dims,
             dropout=model_config.dropout,
             n_outputs=model_config.n_outputs,
@@ -409,11 +457,10 @@ def train_ensemble(
         # Train for fixed epochs (no val set for stopping)
         for epoch in range(train_config.epochs):
             model.train()
-            for X_batch, y_batch in loader:
-                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            for batch in loader:
                 optimizer.zero_grad()
-                pred = model(X_batch)
-                loss = loss_fn(pred, y_batch)
+                pred, y = _model_forward(model, batch, device)
+                loss = loss_fn(pred, y)
                 loss.backward()
                 optimizer.step()
             scheduler.step()
@@ -431,20 +478,40 @@ def predict_ensemble(
     target_transform: str,
     epsilon: float,
     device: torch.device,
+    tglf_dim: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Generate ensemble predictions with uncertainty.
+
+    Args:
+        models: List of trained models.
+        features: Raw feature array (N, D).
+        scaler: Fitted StandardScaler.
+        target_transform: Target transform name.
+        epsilon: Numerical stability constant.
+        device: torch device.
+        tglf_dim: If set and models are dual-input, split features at this index.
 
     Returns:
         (mean_predictions(N,2), std_predictions(N,2)) in original scale.
     """
     X_scaled = scaler.transform(features)
-    X_tensor = torch.tensor(X_scaled, dtype=torch.float32).to(device)
+
+    is_dual = getattr(models[0], 'dual_input', False) if models else False
+
+    if is_dual and tglf_dim is not None:
+        X_tglf = torch.tensor(X_scaled[:, :tglf_dim], dtype=torch.float32).to(device)
+        X_params = torch.tensor(X_scaled[:, tglf_dim:], dtype=torch.float32).to(device)
+    else:
+        X_tensor = torch.tensor(X_scaled, dtype=torch.float32).to(device)
 
     all_preds = []
     for model in models:
         model.eval()
         with torch.no_grad():
-            pred = model(X_tensor).cpu().numpy()
+            if is_dual and tglf_dim is not None:
+                pred = model(X_tglf, X_params).cpu().numpy()
+            else:
+                pred = model(X_tensor).cpu().numpy()
         pred_original = invert_target_transform(pred, target_transform, epsilon)
         all_preds.append(pred_original)
 

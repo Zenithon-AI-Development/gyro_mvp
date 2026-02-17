@@ -1,6 +1,6 @@
 """PyTorch Dataset, target transforms, and fold DataLoader construction."""
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
@@ -20,6 +20,22 @@ class FluxDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.features[idx], self.targets[idx]
+
+
+class DualInputFluxDataset(Dataset):
+    """Dataset returning (tglf_features, param_features, targets) triples."""
+
+    def __init__(self, tglf_features: np.ndarray, param_features: np.ndarray,
+                 targets: np.ndarray):
+        self.tglf = torch.tensor(tglf_features, dtype=torch.float32)
+        self.params = torch.tensor(param_features, dtype=torch.float32)
+        self.targets = torch.tensor(targets, dtype=torch.float32)
+
+    def __len__(self) -> int:
+        return len(self.tglf)
+
+    def __getitem__(self, idx):
+        return self.tglf[idx], self.params[idx], self.targets[idx]
 
 
 def apply_target_transform(
@@ -78,10 +94,21 @@ def make_fold_loaders(
     target_transform: str,
     batch_size: int,
     epsilon: float = 1e-6,
+    tglf_dim: Optional[int] = None,
 ) -> Tuple[DataLoader, DataLoader, StandardScaler]:
     """Create train/val DataLoaders for one CV fold.
 
     Fits StandardScaler on training features only. Applies target transform.
+
+    Args:
+        features: Full feature array (N, D) where D = tglf_dim + param_dim.
+        targets: Target array (N, 2).
+        train_idx, val_idx: Fold indices.
+        target_transform: Target transform name.
+        batch_size: Batch size.
+        epsilon: Numerical stability constant.
+        tglf_dim: If set and < features.shape[1], split into (tglf, params)
+                   and return DualInputFluxDataset. None = single-input.
 
     Returns:
         (train_loader, val_loader, scaler)
@@ -95,8 +122,15 @@ def make_fold_loaders(
     y_train = apply_target_transform(targets[train_idx], target_transform, epsilon)
     y_val = apply_target_transform(targets[val_idx], target_transform, epsilon)
 
-    train_ds = FluxDataset(X_train, y_train)
-    val_ds = FluxDataset(X_val, y_val)
+    # Choose dataset type
+    if tglf_dim is not None and tglf_dim < features.shape[1]:
+        train_ds = DualInputFluxDataset(
+            X_train[:, :tglf_dim], X_train[:, tglf_dim:], y_train)
+        val_ds = DualInputFluxDataset(
+            X_val[:, :tglf_dim], X_val[:, tglf_dim:], y_val)
+    else:
+        train_ds = FluxDataset(X_train, y_train)
+        val_ds = FluxDataset(X_val, y_val)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
