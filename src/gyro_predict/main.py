@@ -90,6 +90,8 @@ def parse_args():
     # WandB
     parser.add_argument("--wandb_entity", default="PLACEHOLDER_ENTITY")
     parser.add_argument("--wandb_project", default="PLACEHOLDER_PROJECT")
+    parser.add_argument("--wandb_group", default="",
+                        help="WandB group name (default: auto-generated from model_type)")
     parser.add_argument("--no_wandb", action="store_true")
 
     return parser.parse_args()
@@ -304,7 +306,7 @@ def main():
             wandb_run = wandb.init(
                 entity=config.wandb.entity,
                 project=config.wandb.project,
-                group=f"{args.model_type}-{input_dim}dims",
+                group=args.wandb_group or f"{args.model_type}-{input_dim}dims",
                 name=f"train_{args.model_type}_{input_dim}dims",
                 config={
                     "model_type": args.model_type,
@@ -463,7 +465,7 @@ def main():
                 ood_wandb_run = wandb.init(
                     entity=config.wandb.entity,
                     project=config.wandb.project,
-                    group=f"{args.model_type}-{input_dim}dims",
+                    group=args.wandb_group or f"{args.model_type}-{input_dim}dims",
                     name=f"ood_{args.model_type}_{input_dim}dims",
                     config=config_dict,
                 )
