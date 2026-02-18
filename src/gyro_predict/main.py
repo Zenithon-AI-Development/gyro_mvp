@@ -408,6 +408,22 @@ def main():
         ensemble_uncertainty_plot(mean_pred, std_pred, targets,
                                   os.path.join(plot_dir, "ensemble_uncertainty.png"))
 
+        # Compute and log training-set ensemble metrics
+        from .loss import compute_metrics as _compute_metrics_train
+        train_ensemble_metrics = _compute_metrics_train(mean_pred, targets, tc.epsilon)
+        print(f"Ensemble train metrics: {train_ensemble_metrics}")
+
+        if wandb_run is not None:
+            wandb_run.summary.update({
+                "train_ensemble/rel_l2_mean": train_ensemble_metrics["rel_l2_mean"],
+                "train_ensemble/mape_electron": train_ensemble_metrics["mape_electron"],
+                "train_ensemble/mape_ion": train_ensemble_metrics["mape_ion"],
+                "train_ensemble/mae_electron": train_ensemble_metrics["mae_electron"],
+                "train_ensemble/mae_ion": train_ensemble_metrics["mae_ion"],
+                "train_ensemble/rmse_electron": train_ensemble_metrics["rmse_electron"],
+                "train_ensemble/rmse_ion": train_ensemble_metrics["rmse_ion"],
+            })
+
         # Summary (only if kfold was run)
         if kfold_result is not None:
             summarize_results(
