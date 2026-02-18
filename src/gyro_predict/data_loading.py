@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 
-from .features import build_feature_vector
+from .features import build_feature_vector, build_structured_vector
 
 
 def parse_experiment_from_run_name(run_name: str) -> str:
@@ -130,7 +130,11 @@ def load_tglf_conditioning(npz_path: str) -> Dict[str, np.ndarray]:
 
 
 def load_all_data(
-    data_dir: str, run_list: pd.DataFrame, global_param_columns: List[str] = None
+    data_dir: str,
+    run_list: pd.DataFrame,
+    global_param_columns: List[str] = None,
+    feature_builder: str = "flat",
+    use_csv_targets: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
     """Load features and targets for runs.
 
@@ -140,6 +144,9 @@ def load_all_data(
         global_param_columns: List of column names to extract as global params.
                               If None or empty, returns TGLF-only features (378 dims).
                               Otherwise, appends these params to get (378 + len) dims.
+        feature_builder: "flat" uses build_feature_vector (378-dim aggregated),
+                         "structured" uses build_structured_vector().ravel() (378-dim ky-major).
+        use_csv_targets: If True, read Q_electron/Q_ion from CSV columns instead of .h5 files.
 
     Returns:
         features: np.ndarray of shape (N, 378) or (N, 378+len(global_param_columns))
@@ -150,6 +157,9 @@ def load_all_data(
     targets_list = []
     loaded_folders = []
     skipped = []
+
+    # Check if CSV has target columns (for use_csv_targets)
+    has_csv_targets = use_csv_targets and "Q_electron" in run_list.columns and "Q_ion" in run_list.columns
 
     for _, row in tqdm(run_list.iterrows(), total=len(run_list), desc="Loading data"):
         folder_name = row["folder_name"]
@@ -163,17 +173,28 @@ def load_all_data(
         h5_path = os.path.join(folder_path, f"{folder_name}.h5")
         npz_path = os.path.join(folder_path, "conditioning_data.npz")
 
-        if not os.path.exists(h5_path) or not os.path.exists(npz_path):
+        # NPZ always required (for TGLF features); h5 only needed if not using CSV targets
+        if not os.path.exists(npz_path):
+            skipped.append(folder_name)
+            continue
+        if not has_csv_targets and not os.path.exists(h5_path):
             skipped.append(folder_name)
             continue
 
-        # Load targets from CGYRO
-        q_elec, q_ion = load_cgyro_targets(h5_path)
+        # Load targets
+        if has_csv_targets:
+            q_elec = float(row["Q_electron"])
+            q_ion = float(row["Q_ion"])
+        else:
+            q_elec, q_ion = load_cgyro_targets(h5_path)
         targets_list.append([q_elec, q_ion])
 
         # Load features from TGLF
         raw_tglf = load_tglf_conditioning(npz_path)
-        feat_tglf = build_feature_vector(raw_tglf)  # (378,)
+        if feature_builder == "structured":
+            feat_tglf = build_structured_vector(raw_tglf).ravel()  # (378,) ky-major
+        else:
+            feat_tglf = build_feature_vector(raw_tglf)  # (378,) channel-major
 
         # Optionally append global parameters from CSV
         if global_param_columns:

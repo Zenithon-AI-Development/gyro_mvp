@@ -70,9 +70,22 @@ def parse_args():
 
     # Model architecture
     parser.add_argument("--model_type", type=str, default="mlp",
-                        choices=["mlp", "film", "hadamard", "bilinear"],
-                        help="Model architecture: mlp (flat concat), film (FiLM conditioning), "
-                             "hadamard (dual-head element-wise), bilinear (dual-head bilinear)")
+                        choices=["mlp", "film", "hadamard", "bilinear",
+                                 "structured_mlp", "structured_hadamard"],
+                        help="Model architecture: mlp (flat), film (FiLM), hadamard (dual-head), "
+                             "bilinear (dual-head), structured_mlp (ky-level), "
+                             "structured_hadamard (ky-level + params)")
+    parser.add_argument("--feature_type", type=str, default="flat",
+                        choices=["flat", "structured"],
+                        help="Feature representation: flat (378-dim aggregated) or "
+                             "structured (21x18 ky-channel, stored flat)")
+    parser.add_argument("--activation", type=str, default="relu",
+                        choices=["relu", "silu"],
+                        help="Activation function for hidden layers")
+    parser.add_argument("--no_kfold", action="store_true",
+                        help="Skip K-fold CV, train ensemble directly on train split")
+    parser.add_argument("--target_from_csv", action="store_true",
+                        help="Load targets from Q_electron/Q_ion CSV columns instead of .h5 files")
 
     # WandB
     parser.add_argument("--wandb_entity", default="PLACEHOLDER_ENTITY")
@@ -126,7 +139,11 @@ def main():
     run_list = load_run_list(csv_path)
     print(f"Run list: {len(run_list)} entries from {args.csv_file}")
 
-    features, targets, metadata = load_all_data(config.paths.data_dir, run_list, global_param_columns)
+    features, targets, metadata = load_all_data(
+        config.paths.data_dir, run_list, global_param_columns,
+        feature_builder=args.feature_type,
+        use_csv_targets=args.target_from_csv,
+    )
     experiment_groups = metadata["experiment"].values
     print(f"Features: {features.shape}, Targets: {targets.shape}")
     print(f"Experiment groups: {np.unique(experiment_groups, return_counts=True)}")
@@ -252,6 +269,8 @@ def main():
             use_softplus=args.use_softplus,
             model_type=args.model_type,
             param_dim=param_dim,
+            feature_type=args.feature_type,
+            activation=args.activation,
         )
         tc = TrainConfig(
             lr=args.lr,
@@ -272,12 +291,13 @@ def main():
             hidden_dims=hidden_dims,
             dropout=args.dropout,
             use_softplus=args.use_softplus,
+            activation=args.activation,
         )
         num_params = _count_parameters(dummy_model)
         print(f"Model parameters: {num_params:,}")
         del dummy_model
 
-        # K-fold evaluation
+        # WandB init
         wandb_run = None
         if config.wandb.enabled:
             import wandb
@@ -299,48 +319,61 @@ def main():
                     "target_transform": args.target_transform,
                     "ensemble_size": args.ensemble_size,
                     "num_params": num_params,
+                    "feature_type": args.feature_type,
+                    "activation": args.activation,
                 },
             )
 
-        kfold_result = run_kfold(
-            features, targets, experiment_groups, metadata, mc, tc, device, wandb_run
-        )
-
-        print(f"\nK-fold mean_rel_l2: {kfold_result['mean_rel_l2']:.4f} "
-              f"+/- {kfold_result['std_rel_l2']:.4f}")
-
-        # Log k-fold metrics to wandb
-        if wandb_run is not None:
-            oof_m = kfold_result["oof_metrics"]
-            wandb_run.summary.update({
-                "kfold/rel_l2_mean": kfold_result["mean_rel_l2"],
-                "kfold/rel_l2_std": kfold_result["std_rel_l2"],
-                "kfold/mape_electron": oof_m["mape_electron"],
-                "kfold/mape_ion": oof_m["mape_ion"],
-                "kfold/mae_electron": oof_m["mae_electron"],
-                "kfold/mae_ion": oof_m["mae_ion"],
-                "kfold/rmse_electron": oof_m["rmse_electron"],
-                "kfold/rmse_ion": oof_m["rmse_ion"],
-            })
-
-        # Plots
+        # K-fold evaluation (optional)
+        kfold_result = None
+        tglf_comp = None
         plot_dir = os.path.join(config.paths.checkpoint_dir, "plots")
-        oof_preds = kfold_result["oof_predictions"]
-        parity_plot(oof_preds, targets, experiment_groups,
-                    os.path.join(plot_dir, "parity_oof.png"))
-        error_distribution_plot(oof_preds, targets,
-                                os.path.join(plot_dir, "error_dist_oof.png"))
-        error_by_regime(oof_preds, targets, experiment_groups,
-                        os.path.join(plot_dir, "error_by_regime.png"))
 
-        # TGLF comparison
-        flux_csv = os.path.join(config.paths.csv_dir, config.paths.flux_comparison_csv)
-        tglf_comp = compare_to_tglf_baseline(oof_preds, targets, flux_csv)
+        if not args.no_kfold:
+            kfold_result = run_kfold(
+                features, targets, experiment_groups, metadata, mc, tc, device, wandb_run
+            )
+
+            print(f"\nK-fold mean_rel_l2: {kfold_result['mean_rel_l2']:.4f} "
+                  f"+/- {kfold_result['std_rel_l2']:.4f}")
+
+            # Log k-fold metrics to wandb
+            if wandb_run is not None:
+                oof_m = kfold_result["oof_metrics"]
+                wandb_run.summary.update({
+                    "kfold/rel_l2_mean": kfold_result["mean_rel_l2"],
+                    "kfold/rel_l2_std": kfold_result["std_rel_l2"],
+                    "kfold/mape_electron": oof_m["mape_electron"],
+                    "kfold/mape_ion": oof_m["mape_ion"],
+                    "kfold/mae_electron": oof_m["mae_electron"],
+                    "kfold/mae_ion": oof_m["mae_ion"],
+                    "kfold/rmse_electron": oof_m["rmse_electron"],
+                    "kfold/rmse_ion": oof_m["rmse_ion"],
+                })
+
+            # Plots
+            oof_preds = kfold_result["oof_predictions"]
+            parity_plot(oof_preds, targets, experiment_groups,
+                        os.path.join(plot_dir, "parity_oof.png"))
+            error_distribution_plot(oof_preds, targets,
+                                    os.path.join(plot_dir, "error_dist_oof.png"))
+            error_by_regime(oof_preds, targets, experiment_groups,
+                            os.path.join(plot_dir, "error_by_regime.png"))
+
+            # TGLF comparison
+            flux_csv = os.path.join(config.paths.csv_dir, config.paths.flux_comparison_csv)
+            if os.path.exists(flux_csv):
+                tglf_comp = compare_to_tglf_baseline(oof_preds, targets, flux_csv)
+            else:
+                print(f"Skipping TGLF baseline comparison ({flux_csv} not found)")
+        else:
+            print("Skipping K-fold (--no_kfold)")
 
         # Train ensemble
         print(f"\n=== TRAINING ENSEMBLE (size={args.ensemble_size}) ===")
         models, scaler = train_ensemble(
-            features, targets, mc, tc, args.ensemble_size, device
+            features, targets, mc, tc, args.ensemble_size, device,
+            wandb_run=wandb_run,
         )
 
         save_dir = os.path.join(config.paths.checkpoint_dir, "ensemble")
@@ -358,11 +391,14 @@ def main():
             "target_transform": args.target_transform,
             "ensemble_size": args.ensemble_size,
             "num_params": num_params,
+            "feature_type": args.feature_type,
+            "activation": args.activation,
         }
         save_ensemble(models, scaler, config_dict, save_dir)
 
         # Determine tglf_dim for predict_ensemble
-        ens_tglf_dim = tglf_dim if args.model_type != "mlp" and param_dim > 0 else None
+        from .train import DUAL_INPUT_TYPES
+        ens_tglf_dim = tglf_dim if args.model_type in DUAL_INPUT_TYPES and param_dim > 0 else None
 
         # Ensemble predictions on training data (sanity check)
         mean_pred, std_pred = predict_ensemble(
@@ -372,11 +408,12 @@ def main():
         ensemble_uncertainty_plot(mean_pred, std_pred, targets,
                                   os.path.join(plot_dir, "ensemble_uncertainty.png"))
 
-        # Summary
-        summarize_results(
-            kfold_result, config_dict, tglf_comp, metadata,
-            os.path.join(config.paths.checkpoint_dir, "results_summary.json"),
-        )
+        # Summary (only if kfold was run)
+        if kfold_result is not None:
+            summarize_results(
+                kfold_result, config_dict, tglf_comp or {}, metadata,
+                os.path.join(config.paths.checkpoint_dir, "results_summary.json"),
+            )
 
         if wandb_run is not None:
             wandb_run.finish()
@@ -516,6 +553,7 @@ def main():
                 hidden_dims=hidden_dims,
                 dropout=saved_config["dropout"],
                 use_softplus=saved_config.get("use_softplus", False),
+                activation=saved_config.get("activation", "relu"),
             ).to(device)
             model.load_state_dict(
                 torch.load(os.path.join(ensemble_dir, f"model_{i}.pt"),
@@ -529,7 +567,8 @@ def main():
 
         tt = saved_config["target_transform"]
         eps = config.train.epsilon
-        eval_tglf_dim = saved_tglf_dim if saved_model_type != "mlp" and saved_param_dim > 0 else None
+        _dual_types = {"film", "hadamard", "bilinear", "structured_hadamard"}
+        eval_tglf_dim = saved_tglf_dim if saved_model_type in _dual_types and saved_param_dim > 0 else None
 
         mean_pred, std_pred = predict_ensemble(
             models, features, scaler, tt, eps, device, tglf_dim=eval_tglf_dim,

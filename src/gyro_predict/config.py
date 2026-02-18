@@ -37,8 +37,10 @@ class ModelConfig:
     dropout: float = 0.3
     n_outputs: int = 2
     use_softplus: bool = True  # Apply Softplus to output to ensure Q > 0
-    model_type: str = "mlp"   # mlp, film, hadamard, bilinear
+    model_type: str = "mlp"   # mlp, film, hadamard, bilinear, structured_mlp, structured_hadamard
     param_dim: int = 0        # 0 for TGLF-only, >0 for dual-input models
+    feature_type: str = "flat"  # "flat" (378-dim aggregated) or "structured" (21x18 ky-channel, stored flat)
+    activation: str = "relu"    # "relu" or "silu"
 
 
 @dataclass

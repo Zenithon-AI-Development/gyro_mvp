@@ -28,6 +28,9 @@ from .dataset import (
 from .loss import RelativeL2Loss, compute_metrics
 from .model import FluxMLP, create_model
 
+# Model types that use dual_input=True (separate TGLF and param inputs)
+DUAL_INPUT_TYPES = {"film", "hadamard", "bilinear", "structured_hadamard"}
+
 
 def set_seed(seed: int):
     """Set all random seeds for reproducibility."""
@@ -87,6 +90,7 @@ def train_one_model(
     train_config: TrainConfig,
     device: torch.device,
     wandb_run=None,
+    metric_prefix: str = "",
 ) -> Tuple[nn.Module, dict]:
     """Train a single model with early stopping.
 
@@ -98,6 +102,7 @@ def train_one_model(
         train_config: Training hyperparameters.
         device: torch device.
         wandb_run: Optional wandb run for logging.
+        metric_prefix: Prefix for wandb metric keys (e.g. "fold_0/").
 
     Returns:
         (best_model, metrics_dict)
@@ -110,6 +115,7 @@ def train_one_model(
         dropout=model_config.dropout,
         n_outputs=model_config.n_outputs,
         use_softplus=model_config.use_softplus,
+        activation=model_config.activation,
     ).to(device)
 
     optimizer = torch.optim.AdamW(
@@ -167,10 +173,10 @@ def train_one_model(
         # Logging
         if wandb_run is not None and epoch % 50 == 0:
             wandb_run.log({
-                "epoch": epoch,
-                "train_loss": train_loss,
-                "val_loss": val_loss,
-                "val_rel_l2_mean": val_rel_l2,
+                f"{metric_prefix}epoch": epoch,
+                f"{metric_prefix}train_loss": train_loss,
+                f"{metric_prefix}val_loss": val_loss,
+                f"{metric_prefix}val_rel_l2_mean": val_rel_l2,
             })
 
         # Early stopping
@@ -226,7 +232,7 @@ def run_kfold(
 
     # Determine if dual-input splitting is needed
     tglf_dim = None
-    if model_config.model_type != "mlp" and model_config.param_dim > 0:
+    if model_config.model_type in DUAL_INPUT_TYPES and model_config.param_dim > 0:
         tglf_dim = model_config.input_dim - model_config.param_dim
 
     fold_metrics = []
@@ -259,6 +265,7 @@ def run_kfold(
             train_config,
             device,
             wandb_run=wandb_run,
+            metric_prefix=f"fold_{fold_idx}/" if wandb_run is not None else "",
         )
 
         fold_metrics.append(metrics)
@@ -405,6 +412,7 @@ def train_ensemble(
     train_config: TrainConfig,
     ensemble_size: int,
     device: torch.device,
+    wandb_run=None,
 ) -> Tuple[List[nn.Module], StandardScaler]:
     """Train an ensemble of models on all data.
 
@@ -413,7 +421,7 @@ def train_ensemble(
     """
     # Determine if dual-input splitting is needed
     tglf_dim = None
-    if model_config.model_type != "mlp" and model_config.param_dim > 0:
+    if model_config.model_type in DUAL_INPUT_TYPES and model_config.param_dim > 0:
         tglf_dim = model_config.input_dim - model_config.param_dim
 
     # Fit scaler on all data
@@ -444,6 +452,7 @@ def train_ensemble(
             dropout=model_config.dropout,
             n_outputs=model_config.n_outputs,
             use_softplus=model_config.use_softplus,
+            activation=model_config.activation,
         ).to(device)
 
         optimizer = torch.optim.AdamW(
@@ -457,13 +466,24 @@ def train_ensemble(
         # Train for fixed epochs (no val set for stopping)
         for epoch in range(train_config.epochs):
             model.train()
+            epoch_loss_sum = 0.0
+            n_batches = 0
             for batch in loader:
                 optimizer.zero_grad()
                 pred, y = _model_forward(model, batch, device)
                 loss = loss_fn(pred, y)
                 loss.backward()
                 optimizer.step()
+                epoch_loss_sum += loss.item()
+                n_batches += 1
             scheduler.step()
+
+            if wandb_run is not None and epoch % 50 == 0:
+                train_loss = epoch_loss_sum / max(n_batches, 1)
+                wandb_run.log({
+                    f"ensemble/member_{member_idx}/epoch": epoch,
+                    f"ensemble/member_{member_idx}/train_loss": train_loss,
+                })
 
         model.eval()
         models.append(model)
