@@ -437,7 +437,7 @@ def train_ensemble(
             X_scaled[:, :tglf_dim], X_scaled[:, tglf_dim:], y_transformed)
     else:
         ds = FluxDataset(X_scaled, y_transformed)
-    loader = DataLoader(ds, batch_size=train_config.batch_size, shuffle=True)
+    loader = DataLoader(ds, batch_size=train_config.batch_size, shuffle=True, drop_last=True)
 
     models = []
     for member_idx in range(ensemble_size):
