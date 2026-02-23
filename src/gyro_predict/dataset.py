@@ -132,7 +132,8 @@ def make_fold_loaders(
         train_ds = FluxDataset(X_train, y_train)
         val_ds = FluxDataset(X_val, y_val)
 
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=True)
+    drop = (len(train_ds) % batch_size == 1)
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, drop_last=drop)
     val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
 
     return train_loader, val_loader, scaler
